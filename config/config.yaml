@@ -4,3 +4,6 @@ delay_queue:
   max_retries: 3
   retry_interval: 1s
   worker_num: 20 
+  redis_addr: "127.0.0.1:6379"
+  redis_password: ""
+  redis_db: 1
