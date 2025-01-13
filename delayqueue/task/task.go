@@ -6,13 +6,10 @@ import (
 	"time"
 )
 
-// Request 定义任务请求参数的接口
+// Request 任务请求接口
 type Request interface {
-	// GetTaskID 获取任务ID
 	GetTaskID() string
-	// GetTaskType 获取任务类型
 	GetTaskType() string
-	// Execute 执行处理函数
 	Execute(handler interface{}) error
 }
 
@@ -26,13 +23,12 @@ func GetTypeFromStruct(req interface{}) string {
 	return strings.ToLower(strings.TrimSuffix(t.Name(), "Request"))
 }
 
-// Handler 定义任务处理器的接口
+// Handler 任务处理器接口
 type Handler interface {
-	// Handle 处理任务
 	Handle(req Request) error
 }
 
-// Task 定义延时任务
+// Task 任务结构体
 type Task struct {
 	ID        string
 	Request   Request

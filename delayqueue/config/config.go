@@ -14,6 +14,9 @@ type DelayQueueConfig struct {
 	MaxRetries    int           `yaml:"max_retries"`
 	RetryInterval time.Duration `yaml:"retry_interval"`
 	WorkerNum     int           `yaml:"worker_num"`
+	RedisAddr     string        `yaml:"redis_addr"`
+	RedisPassword string        `yaml:"redis_password"`
+	RedisDB       int           `yaml:"redis_db"`
 }
 
 // Config 配置

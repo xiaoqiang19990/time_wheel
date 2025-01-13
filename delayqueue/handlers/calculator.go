@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"encoding/json"
 	"fmt"
 	"timewheel/delayqueue/task"
 	"timewheel/delayqueue/utils"
@@ -65,4 +66,18 @@ func (h *CalculatorHandler) Handle(req task.Request) error {
 	fmt.Printf("Calculation result for task %s: %d + %d = %d\n",
 		calcReq.TaskID, calcReq.A, calcReq.B, result)
 	return nil
+}
+
+func (h *CalculationRequest) UnmarshalRequest(data []byte) (task.Request, error) {
+	var req CalculationRequest
+	if err := json.Unmarshal(data, &req); err != nil {
+		return nil, err
+	}
+	return &req, nil
+}
+
+// 修改 CalculationRequest
+func (r *CalculationRequest) Marshal() []byte {
+	data, _ := json.Marshal(r)
+	return data
 }

@@ -2,11 +2,14 @@ package queue
 
 import (
 	"container/list"
+	"encoding/json"
 	"fmt"
 	"sync"
 	"sync/atomic"
 	"time"
 	"timewheel/delayqueue/config"
+	"timewheel/delayqueue/handlers"
+	"timewheel/delayqueue/storage"
 	"timewheel/delayqueue/task"
 )
 
@@ -27,8 +30,9 @@ type DelayQueue struct {
 	tasks      map[string]int
 	workerPool chan struct{}
 	metrics    *Metrics
-	wg         sync.WaitGroup // 添加 WaitGroup 来管理 goroutine
-	stopCh     chan struct{}  // 添加停止信号通道
+	wg         sync.WaitGroup
+	stopCh     chan struct{}
+	storage    storage.Storage
 }
 
 type Slot struct {
@@ -48,19 +52,28 @@ type Metrics struct {
 func NewDelayQueue(cfg *config.DelayQueueConfig) (*DelayQueue, error) {
 	dq := &DelayQueue{
 		slots:      make([]*Slot, cfg.SlotNum),
-		workerPool: make(chan struct{}, cfg.WorkerNum),
+		ticker:     time.NewTicker(cfg.Interval),
 		options:    cfg,
-		current:    0,
-		tasks:      make(map[string]int),
 		metrics:    &Metrics{},
 		stopCh:     make(chan struct{}),
+		storage:    storage.NewRedisStorage(cfg.RedisAddr, cfg.RedisPassword, cfg.RedisDB),
+		tasks:      make(map[string]int),
+		workerPool: make(chan struct{}, cfg.WorkerNum),
 	}
 
+	// 初始化分片
 	for i := 0; i < cfg.SlotNum; i++ {
-		dq.slots[i] = &Slot{tasks: list.New()}
+		dq.slots[i] = &Slot{
+			tasks: list.New(),
+			mutex: sync.RWMutex{},
+		}
 	}
 
-	dq.ticker = time.NewTicker(cfg.Interval)
+	// 先恢复任务，再启动时间轮
+	if err := dq.recoverTasks(); err != nil {
+		return nil, fmt.Errorf("failed to recover tasks: %v", err)
+	}
+
 	go dq.run()
 
 	return dq, nil
@@ -81,6 +94,27 @@ func (dq *DelayQueue) addTask(t *task.Task) error {
 	fmt.Printf("Adding task %s: slot %d, current slot: %d, delay: %v, execute at: %v\n",
 		t.ID, pos, dq.current, t.Delay, t.Timestamp)
 
+	// 先保存到Redis
+	taskData, err := json.Marshal(t.Request)
+	if err != nil {
+		return fmt.Errorf("marshal request error: %v", err)
+	}
+
+	taskInfo := &storage.TaskInfo{
+		ID:        t.ID,
+		Type:      t.Request.GetTaskType(),
+		Data:      taskData,
+		Delay:     t.Delay,
+		Timestamp: t.Timestamp,
+		Retries:   t.Retries,
+	}
+
+	if err := dq.storage.Save(taskInfo); err != nil {
+		fmt.Printf("Failed to save task to storage: %v\n", err)
+		return err
+	}
+
+	// 保存成功后添加到时间轮
 	slot := dq.slots[pos]
 	slot.mutex.Lock()
 	defer slot.mutex.Unlock()
@@ -88,6 +122,8 @@ func (dq *DelayQueue) addTask(t *task.Task) error {
 	slot.tasks.PushBack(t)
 	dq.tasks[t.ID] = pos
 	atomic.AddInt64(&dq.metrics.pendingTasks, 1)
+
+	fmt.Printf("Task %s successfully saved to storage and added to time wheel\n", t.ID)
 	return nil
 }
 
@@ -124,7 +160,7 @@ func (dq *DelayQueue) run() {
 			currentSlot := dq.slots[dq.current]
 			currentSlot.mutex.Lock()
 
-			fmt.Printf("\nChecking slot %d at %v\n", dq.current, now)
+			// fmt.Printf("\nChecking slot %d at %v\n", dq.current, now)
 
 			var next *list.Element
 			for e := currentSlot.tasks.Front(); e != nil; e = next {
@@ -155,7 +191,6 @@ func (dq *DelayQueue) run() {
 
 // executeTask 执行任务
 func (dq *DelayQueue) executeTask(t *task.Task) {
-	// 获取工作线程
 	dq.workerPool <- struct{}{}
 	defer func() {
 		<-dq.workerPool
@@ -166,12 +201,18 @@ func (dq *DelayQueue) executeTask(t *task.Task) {
 
 	fmt.Printf("Executing task %s at %v\n", t.ID, time.Now())
 	err := t.Handler.Handle(t.Request)
-	fmt.Println("err", err)
+
+	// 先从存储中删除任务
+	if err := dq.storage.Remove(t.ID); err != nil {
+		fmt.Printf("Failed to remove task from storage: %v\n", err)
+	} else {
+		fmt.Printf("Task %s removed from storage\n", t.ID)
+	}
+
 	atomic.AddInt64(&dq.metrics.executionTime, time.Since(start).Milliseconds())
 	if err != nil {
 		if t.Retries < dq.options.MaxRetries {
 			atomic.AddInt64(&dq.metrics.retryTasks, 1)
-			// 重试逻辑
 			t.Retries++
 			t.Delay = dq.options.RetryInterval
 			t.Timestamp = time.Now().Add(t.Delay)
@@ -195,4 +236,53 @@ func (dq *DelayQueue) Stop() {
 	// 等待所有任务完成
 	dq.wg.Wait()
 	fmt.Println("All tasks completed, delay queue stopped")
+}
+
+// recoverTasks 恢复任务
+func (dq *DelayQueue) recoverTasks() error {
+	tasks, err := dq.storage.GetAll()
+	if err != nil {
+		return err
+	}
+
+	if len(tasks) > 0 {
+		fmt.Printf("Recovering %d tasks from storage\n", len(tasks))
+	}
+
+	now := time.Now()
+	for _, taskInfo := range tasks {
+		// 创建请求和处理器
+		calcReq := &handlers.CalculationRequest{}
+		if err := json.Unmarshal(taskInfo.Data, calcReq); err != nil {
+			fmt.Printf("unmarshal request error: %v\n", err)
+			continue
+		}
+
+		// 使用通用处理器
+		handler := handlers.NewCalculatorHandler()
+
+		// 创建新任务
+		t := task.NewTask(taskInfo.ID, calcReq, handler, taskInfo.Delay)
+		t.Retries = taskInfo.Retries
+		t.Timestamp = taskInfo.Timestamp
+
+		if now.After(t.Timestamp) {
+			fmt.Printf("Recovering expired task %s for immediate execution\n", t.ID)
+			// 对于过期任务，立即执行
+			dq.wg.Add(1)
+			go func(task *task.Task) {
+				defer dq.wg.Done()
+				dq.executeTask(task)
+			}(t)
+		} else {
+			// 对于未过期任务，重新计算延迟并添加
+			t.Delay = t.Timestamp.Sub(now)
+			fmt.Printf("Recovering task %s with delay %v\n", t.ID, t.Delay)
+			if err := dq.addTask(t); err != nil {
+				fmt.Printf("recover task error: %v\n", err)
+			}
+		}
+	}
+
+	return nil
 }
