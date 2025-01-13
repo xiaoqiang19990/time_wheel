@@ -1,0 +1,6 @@
+delay_queue:
+  slot_num: 60
+  interval: 100ms
+  max_retries: 3
+  retry_interval: 1s
+  worker_num: 20 
