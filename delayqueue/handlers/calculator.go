@@ -17,7 +17,7 @@ type CalculationRequest struct {
 // NewCalculationRequest 创建计算请求
 func NewCalculationRequest(a, b int) *CalculationRequest {
 	return &CalculationRequest{
-		TaskID: utils.GenerateTaskIDWithPrefix("calc"),
+		TaskID: utils.GenerateTaskIDWithPrefix(task.GetTypeFromStruct(CalculationRequest{})),
 		A:      a,
 		B:      b,
 	}
